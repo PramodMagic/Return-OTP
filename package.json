@@ -1,15 +1,18 @@
 {
-  "name": "otp-return-qty-tool",
+  "name": "otp-excel-tool",
   "version": "1.0.0",
   "private": true,
-  "scripts": { "dev": "next dev", "build": "next build", "start": "next start" },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
   "dependencies": {
-    "imapflow": "^1.0.181",
-    "mailparser": "^3.7.2",
-    "next": "^14.2.30",
+    "imapflow": "^1.0.164",
+    "mailparser": "^3.7.1",
+    "next": "14.2.15",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "xlsx": "^0.18.5"
-  },
-  "devDependencies": { "@types/node": "^22.10.2", "@types/react": "^18.3.18", "typescript": "^5.7.2" }
+  }
 }
