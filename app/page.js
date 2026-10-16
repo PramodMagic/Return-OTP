@@ -154,6 +154,21 @@ export default function Home() {
           {busy ? "Kaam chal raha hai..." : "OTP nikaalo"}
         </button>
 
+        <p style={{ marginTop: 20, fontSize: 14, color: "#5a6478" }}>
+          Pehli baar use kar rahe ho?{" "}
+          <a
+            href={accessKey ? `/api/auth/start?key=${encodeURIComponent(accessKey)}` : "#"}
+            onClick={(e) => {
+              if (!accessKey) {
+                e.preventDefault();
+                setError("Pehle upar Access Key daalo.");
+              }
+            }}
+          >
+            Outlook connect karo
+          </a>
+        </p>
+
         {progress && <p style={{ color: "#2f5bea" }}>{progress}</p>}
         {summary && <p style={{ color: "#16803c", fontWeight: 600 }}>{summary}</p>}
         {error && <p style={{ color: "#c62828", fontWeight: 600 }}>{error}</p>}

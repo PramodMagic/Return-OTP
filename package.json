@@ -1,6 +1,6 @@
 {
   "name": "otp-excel-tool",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -8,8 +8,6 @@
     "start": "next start"
   },
   "dependencies": {
-    "imapflow": "^1.0.164",
-    "mailparser": "^3.7.1",
     "next": "14.2.15",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

@@ -1,6 +1,3 @@
-import { ImapFlow } from "imapflow";
-import { simpleParser } from "mailparser";
-
 export const runtime = "nodejs";
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
@@ -22,15 +19,97 @@ const DEFAULT_OTP = /(?:otp|one[\s-]*time[\s-]*password|verification\s*code|code
 const DEFAULT_QTY =
   /(?:total\s*return\s*(?:qty|quantity)|return\s*(?:qty|quantity))\D{0,30}(\d+)/i;
 
-function cleanText(parsed) {
-  let text = parsed.text || "";
-  if (!text && parsed.html) {
-    text = String(parsed.html)
-      .replace(/<style[\s\S]*?<\/style>/gi, " ")
-      .replace(/<[^>]+>/g, " ")
-      .replace(/&nbsp;/g, " ");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function getAccessToken() {
+  const { MS_CLIENT_ID, MS_CLIENT_SECRET, MS_REFRESH_TOKEN } = process.env;
+  const tenant = process.env.MS_TENANT || "common";
+  const res = await fetch(
+    `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: MS_CLIENT_ID,
+        client_secret: MS_CLIENT_SECRET,
+        grant_type: "refresh_token",
+        refresh_token: MS_REFRESH_TOKEN,
+        scope: "offline_access Mail.Read",
+      }),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.access_token) {
+    const msg = data.error_description || data.error || "Token nahi mila";
+    throw new Error(msg.split("\r\n")[0]);
   }
-  return text.replace(/\s+/g, " ").trim();
+  return data.access_token;
+}
+
+async function graphSearch(token, orderId) {
+  const q = encodeURIComponent(`"${orderId.replace(/"/g, "")}"`);
+  const url =
+    `https://graph.microsoft.com/v1.0/me/messages?$search=${q}` +
+    `&$top=25&$select=receivedDateTime,subject,body,from`;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Prefer: 'outlook.body-content-type="text"',
+      },
+      cache: "no-store",
+    });
+    if (res.status === 429 && attempt === 0) {
+      const wait = Math.min(parseInt(res.headers.get("retry-after") || "3", 10), 10);
+      await sleep(wait * 1000);
+      continue;
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error?.message || `Microsoft error ${res.status}`);
+    }
+    return data.value || [];
+  }
+  throw new Error("Microsoft ne thodi der rok diya, kuch der baad try karo");
+}
+
+async function processOne(token, orderId, since, otpRegex, qtyRegex) {
+  const messages = await graphSearch(token, orderId);
+
+  const from = (process.env.EMAIL_FROM || "").toLowerCase();
+  const candidates = messages
+    .filter((m) => new Date(m.receivedDateTime) >= since)
+    .filter(
+      (m) =>
+        !from ||
+        (m.from?.emailAddress?.address || "").toLowerCase().includes(from)
+    )
+    .sort((a, b) => new Date(b.receivedDateTime) - new Date(a.receivedDateTime))
+    .slice(0, 3);
+
+  if (candidates.length === 0) {
+    return { otp: "", qty: "", status: "Email nahi mila" };
+  }
+
+  for (const m of candidates) {
+    const text = `${m.subject || ""} ${m.body?.content || ""}`
+      .replace(/\s+/g, " ")
+      .trim();
+    // Order id sach mein email mein hona chahiye
+    if (!text.includes(orderId)) continue;
+
+    const otpMatch = text.match(otpRegex);
+    const qtyMatch = text.match(qtyRegex);
+    if (otpMatch || qtyMatch) {
+      return {
+        otp: otpMatch ? otpMatch[1] : "",
+        qty: qtyMatch ? qtyMatch[1] : "",
+        status: "OK",
+      };
+    }
+  }
+  return { otp: "", qty: "", status: "Email mila par OTP/Qty nahi mila" };
 }
 
 export async function POST(req) {
@@ -39,10 +118,16 @@ export async function POST(req) {
     return Response.json({ error: "Access key galat hai." }, { status: 401 });
   }
 
-  const { IMAP_HOST, IMAP_USER, IMAP_PASS } = process.env;
-  if (!IMAP_HOST || !IMAP_USER || !IMAP_PASS) {
+  const { MS_CLIENT_ID, MS_CLIENT_SECRET, MS_REFRESH_TOKEN } = process.env;
+  if (!MS_CLIENT_ID || !MS_CLIENT_SECRET) {
     return Response.json(
-      { error: "Vercel mein IMAP_HOST, IMAP_USER, IMAP_PASS set nahi hain." },
+      { error: "Vercel mein MS_CLIENT_ID aur MS_CLIENT_SECRET set nahi hain." },
+      { status: 500 }
+    );
+  }
+  if (!MS_REFRESH_TOKEN) {
+    return Response.json(
+      { error: "Outlook abhi connect nahi hua. Page par 'Outlook connect karo' dabao (README Step 5)." },
       { status: 500 }
     );
   }
@@ -53,85 +138,44 @@ export async function POST(req) {
   } catch {
     return Response.json({ error: "Request galat hai." }, { status: 400 });
   }
-  const orderIds = Array.isArray(body.orderIds) ? body.orderIds.slice(0, 40) : [];
+  const orderIds = Array.isArray(body.orderIds)
+    ? body.orderIds.map((v) => String(v).trim()).filter(Boolean).slice(0, 40)
+    : [];
+
+  let token;
+  try {
+    token = await getAccessToken();
+  } catch (e) {
+    return Response.json(
+      {
+        error:
+          "Outlook se connect nahi ho paya: " +
+          e.message +
+          " (Client secret ya refresh token check karo, ya Outlook connect dobara karo.)",
+      },
+      { status: 500 }
+    );
+  }
 
   const otpRegex = buildRegex(process.env.OTP_REGEX, DEFAULT_OTP);
   const qtyRegex = buildRegex(process.env.QTY_REGEX, DEFAULT_QTY);
   const days = parseInt(process.env.SEARCH_DAYS || "60", 10);
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
-  const client = new ImapFlow({
-    host: IMAP_HOST,
-    port: 993,
-    secure: true,
-    auth: { user: IMAP_USER, pass: IMAP_PASS },
-    logger: false,
-  });
-
   const results = {};
+  const CONCURRENCY = 3; // Microsoft ek saath zyada requests pasand nahi karta
 
-  try {
-    await client.connect();
-  } catch (e) {
-    return Response.json(
-      { error: "Email se connect nahi ho paya. App Password aur IMAP settings check karo." },
-      { status: 500 }
+  for (let i = 0; i < orderIds.length; i += CONCURRENCY) {
+    const group = orderIds.slice(i, i + CONCURRENCY);
+    await Promise.all(
+      group.map(async (orderId) => {
+        try {
+          results[orderId] = await processOne(token, orderId, since, otpRegex, qtyRegex);
+        } catch (e) {
+          results[orderId] = { otp: "", qty: "", status: "Error: " + (e.message || "unknown") };
+        }
+      })
     );
-  }
-
-  const lock = await client.getMailboxLock(process.env.IMAP_MAILBOX || "INBOX");
-  try {
-    for (const rawId of orderIds) {
-      const orderId = String(rawId).trim();
-      if (!orderId) continue;
-
-      try {
-        const query = { body: orderId, since };
-        if (process.env.EMAIL_FROM) query.from = process.env.EMAIL_FROM;
-
-        const uids = await client.search(query, { uid: true });
-        if (!uids || uids.length === 0) {
-          results[orderId] = { otp: "", qty: "", status: "Email nahi mila" };
-          continue;
-        }
-
-        // Sabse naye 3 email dekhenge
-        const latest = [...uids].sort((a, b) => b - a).slice(0, 3);
-        let found = null;
-
-        for (const uid of latest) {
-          const msg = await client.fetchOne(uid, { source: true }, { uid: true });
-          if (!msg || !msg.source) continue;
-          const parsed = await simpleParser(msg.source);
-          const text = cleanText(parsed);
-          // Order id sach mein email mein hona chahiye
-          if (!text.includes(orderId)) continue;
-
-          const otpMatch = text.match(otpRegex);
-          const qtyMatch = text.match(qtyRegex);
-          if (otpMatch || qtyMatch) {
-            found = {
-              otp: otpMatch ? otpMatch[1] : "",
-              qty: qtyMatch ? qtyMatch[1] : "",
-              status: "OK",
-            };
-            break;
-          }
-        }
-
-        results[orderId] =
-          found || { otp: "", qty: "", status: "Email mila par OTP/Qty nahi mila" };
-      } catch (e) {
-        results[orderId] = { otp: "", qty: "", status: "Error: " + (e.message || "unknown") };
-      }
-    }
-  } finally {
-    lock.release();
-    try {
-      await client.logout();
-    } catch {
-      /* ignore */
-    }
   }
 
   return Response.json({ results });
